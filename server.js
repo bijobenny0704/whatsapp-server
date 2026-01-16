@@ -9,10 +9,10 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// 1. SETUP STATIC FOLDER FOR VIDEOS
+// STATIC FILES
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-app.use('/uploads', express.static(UPLOAD_DIR)); // Access videos via http://url/uploads/filename.mp4
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // ⚠️ YOUR MONGODB LINK
 const MONGO_URI = "mongodb+srv://bijobenny0704_db_user:GGqNHv2v6itXU3nw@cluster0.9wymndv.mongodb.net/whatsapp_clone?retryWrites=true&w=majority&appName=Cluster0";
@@ -37,18 +37,26 @@ const groupSchema = new mongoose.Schema({
   admin: String
 });
 
+// UPDATED: Support Text, Image, Video, Location
 const messageSchema = new mongoose.Schema({
-  text: String,
+  text: String, // Caption or Text
+  msgType: { type: String, default: 'text' }, // 'text', 'image', 'video', 'location'
+  mediaUrl: String,
+  location: {
+    latitude: Number,
+    longitude: Number
+  },
   sender: String, senderName: String, receiver: String,
   isGroup: { type: Boolean, default: false },
   readBy: [String], 
   timestamp: { type: Date, default: Date.now }
 });
 
-// STATUS SCHEMA (Expires in 24h)
+// UPDATED: Support Image & Video
 const statusSchema = new mongoose.Schema({
   text: String,
-  videoUrl: String,
+  mediaUrl: String,
+  mediaType: { type: String, default: 'video' }, // 'video' or 'image'
   userCode: String,
   userName: String,
   timestamp: { type: Date, default: Date.now, expires: 86400 } 
@@ -60,10 +68,9 @@ const Message = mongoose.model('Message', messageSchema);
 const Status = mongoose.model('Status', statusSchema);
 
 const server = http.createServer(app);
-// Increase limit for video buffering
 const io = new Server(server, { 
   cors: { origin: "*" },
-  maxHttpBufferSize: 1e8 // 100 MB Video Limit
+  maxHttpBufferSize: 1e8 // 100 MB Limit
 });
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -74,38 +81,44 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- VIDEO UPLOAD VIA SOCKET (No Multer Needed) ---
-  socket.on('upload_status_video', async ({ buffer, caption, userCode, userName }) => {
+  // --- UNIVERSAL UPLOAD HANDLER (Status & Chat) ---
+  socket.on('upload_media', async ({ buffer, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
     try {
-      console.log(`[UPLOAD] Receiving video from ${userName}...`);
+      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}`);
       
-      // 1. SAFETY CHECK (Mock AI)
-      if (caption.includes("bad")) {
-        return socket.emit('upload_error', 'Upload rejected: Prohibited content.');
-      }
-
-      // 2. SAVE TO DISK
-      const fileName = `status_${Date.now()}.mp4`;
+      const ext = mediaType === 'video' ? 'mp4' : 'jpg';
+      const fileName = `${type}_${Date.now()}.${ext}`;
       const filePath = path.join(UPLOAD_DIR, fileName);
       
-      // Write buffer to file
       fs.writeFileSync(filePath, buffer);
-      
-      // 3. GENERATE URL (Use Render URL in production, localhost for now)
-      // Note: In production, this needs your full Render URL: https://your-app.onrender.com
+      // NOTE: In production, replace with full server URL
       const fileUrl = `/uploads/${fileName}`; 
 
-      // 4. SAVE TO DB
-      const newStatus = new Status({ text: caption, videoUrl: fileUrl, userCode, userName });
-      await newStatus.save();
-
-      console.log(`[UPLOAD] Success! Saved at ${filePath}`);
-      io.emit('status_updated'); // Notify all phones
-      socket.emit('upload_success');
+      if (type === 'status') {
+        const newStatus = new Status({ text: caption, mediaUrl: fileUrl, mediaType, userCode, userName });
+        await newStatus.save();
+        io.emit('status_updated');
+        socket.emit('upload_success');
+      } 
+      else if (type === 'chat') {
+        // Automatically send message after upload
+        const newMessage = new Message({
+          text: caption || (mediaType === 'image' ? '📷 Photo' : '🎥 Video'),
+          msgType: mediaType,
+          mediaUrl: fileUrl,
+          sender: userCode, senderName: userName, receiver, isGroup,
+          readBy: [userCode]
+        });
+        await newMessage.save();
+        
+        if (isGroup) socket.to(receiver).emit('receive_message', newMessage);
+        else socket.to(receiver).emit('receive_message', newMessage);
+        socket.emit('receive_message', newMessage); // Echo back to sender
+      }
 
     } catch (e) {
-      console.error("Upload Failed:", e);
-      socket.emit('upload_error', 'Server Write Error');
+      console.error("Upload Error:", e);
+      socket.emit('upload_error', 'Write Failed');
     }
   });
 
@@ -135,7 +148,7 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- CHAT ---
+  // --- CHAT CORE ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -157,6 +170,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', async (data) => {
+    // Standard text/location handler
     const newMessage = new Message({ ...data, readBy: [data.sender] });
     await newMessage.save();
     socket.to(data.receiver).emit('receive_message', newMessage);
@@ -198,24 +212,20 @@ io.on('connection', (socket) => {
 
   // --- STATUS SYNC ---
   socket.on('get_statuses', async (myCode) => {
-    // 1. Find Friends
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false });
     const friends = new Set();
     messages.forEach(m => friends.add(m.sender === myCode ? m.receiver : m.sender));
 
-    // 2. Get Statuses
     const allStatuses = await Status.find().sort({ timestamp: -1 });
     
-    // 3. Sort (Friends First)
     const organized = allStatuses.map(s => ({
       ...s.toObject(),
       isFriend: friends.has(s.userCode),
       isMe: s.userCode === myCode,
-      // Fix URL for App usage (Assuming server is hosting /uploads)
-      videoUrl: s.videoUrl.startsWith('http') ? s.videoUrl : `https://otoevnt-server.onrender.com${s.videoUrl}`
+      // Fix URL for App usage
+      mediaUrl: s.mediaUrl.startsWith('http') ? s.mediaUrl : `https://otoevnt-server.onrender.com${s.mediaUrl}`
     }));
     
-    // Custom Sort: Me -> Friends -> Others
     organized.sort((a, b) => {
         if (a.isMe) return -1;
         if (b.isMe) return 1;
