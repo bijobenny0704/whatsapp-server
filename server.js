@@ -24,7 +24,7 @@ const userSchema = new mongoose.Schema({
 });
 
 const groupSchema = new mongoose.Schema({
-  name: { type: String, unique: true }, // Added Unique constraint
+  name: { type: String, unique: true },
   groupCode: { type: String, unique: true },
   members: [String],
   admin: String
@@ -32,9 +32,7 @@ const groupSchema = new mongoose.Schema({
 
 const messageSchema = new mongoose.Schema({
   text: String,
-  sender: String, 
-  senderName: String, 
-  receiver: String,
+  sender: String, senderName: String, receiver: String,
   isGroup: { type: Boolean, default: false },
   readBy: [String], 
   timestamp: { type: Date, default: Date.now }
@@ -134,19 +132,15 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
 
-  // --- 5. GROUP CREATION (WITH UNIQUE NAME CHECK) ---
+  // --- 5. GROUP LOGIC ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
-        
-        // 1. Check Name Length
         if (groupName.length < 3) return socket.emit('error', 'Name too short (min 3 chars)');
-
-        // 2. Check if Name Exists (NEW)
+        
+        // Check Duplicate Name
         const existingGroup = await Group.findOne({ name: groupName });
-        if (existingGroup) {
-            return socket.emit('error', `Group name "${groupName}" is already taken!`);
-        }
+        if (existingGroup) return socket.emit('error', `Group "${groupName}" already exists!`);
 
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
@@ -154,28 +148,32 @@ io.on('connection', (socket) => {
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
-        
         if (!user.joinedGroups) user.joinedGroups = [];
         user.joinedGroups.push(newGroup._id.toString());
         await user.save();
-        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { 
-        console.error("Group Create Error:", e);
-        socket.emit('error', 'Group Create Failed'); 
-      }
+      } catch (e) { socket.emit('error', 'Group Create Failed'); }
   });
   
-  socket.on('join_group', async ({ groupCode, userCode }) => {
-    const group = await Group.findOne({ groupCode });
-    if (!group) return socket.emit('error', 'Group not found');
+  // --- UPDATED JOIN LOGIC (Name OR Code) ---
+  socket.on('join_group', async ({ groupIdentifier, userCode }) => {
+    // Search by EITHER Group Code OR Group Name
+    const group = await Group.findOne({
+      $or: [
+        { groupCode: groupIdentifier },
+        { name: groupIdentifier }
+      ]
+    });
+
+    if (!group) return socket.emit('error', 'Group not found (Check Name or Code)');
     if (group.members.includes(userCode)) return socket.emit('error', 'Already in group');
+
     group.members.push(userCode);
     await group.save();
     await User.updateOne({ chatCode: userCode }, { $push: { joinedGroups: group._id.toString() } });
-    socket.join(groupCode);
-    socket.emit('group_joined', { id: groupCode, name: group.name });
+    socket.join(group.groupCode);
+    socket.emit('group_joined', { id: group.groupCode, name: group.name });
   });
 });
 
