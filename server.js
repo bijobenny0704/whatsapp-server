@@ -37,26 +37,23 @@ const groupSchema = new mongoose.Schema({
   admin: String
 });
 
-// UPDATED: Support Text, Image, Video, Location
+// Chat Messages (Supports Text, Image, Video, Location)
 const messageSchema = new mongoose.Schema({
-  text: String, // Caption or Text
+  text: String, 
   msgType: { type: String, default: 'text' }, // 'text', 'image', 'video', 'location'
   mediaUrl: String,
-  location: {
-    latitude: Number,
-    longitude: Number
-  },
+  location: { latitude: Number, longitude: Number },
   sender: String, senderName: String, receiver: String,
   isGroup: { type: Boolean, default: false },
   readBy: [String], 
   timestamp: { type: Date, default: Date.now }
 });
 
-// UPDATED: Support Image & Video
+// Status/Reels (Supports Image, Video)
 const statusSchema = new mongoose.Schema({
   text: String,
   mediaUrl: String,
-  mediaType: { type: String, default: 'video' }, // 'video' or 'image'
+  mediaType: { type: String, default: 'video' },
   userCode: String,
   userName: String,
   timestamp: { type: Date, default: Date.now, expires: 86400 } 
@@ -81,27 +78,27 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- UNIVERSAL UPLOAD HANDLER (Status & Chat) ---
+  // --- UNIVERSAL MEDIA UPLOAD ---
   socket.on('upload_media', async ({ buffer, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
     try {
-      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}`);
+      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}...`);
       
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
       const fileName = `${type}_${Date.now()}.${ext}`;
       const filePath = path.join(UPLOAD_DIR, fileName);
       
       fs.writeFileSync(filePath, buffer);
-      // NOTE: In production, replace with full server URL
+      
+      // PRODUCTION URL
       const fileUrl = `/uploads/${fileName}`; 
 
       if (type === 'status') {
         const newStatus = new Status({ text: caption, mediaUrl: fileUrl, mediaType, userCode, userName });
         await newStatus.save();
-        io.emit('status_updated');
+        io.emit('status_updated'); // Refresh everyone's reels
         socket.emit('upload_success');
       } 
       else if (type === 'chat') {
-        // Automatically send message after upload
         const newMessage = new Message({
           text: caption || (mediaType === 'image' ? '📷 Photo' : '🎥 Video'),
           msgType: mediaType,
@@ -113,9 +110,8 @@ io.on('connection', (socket) => {
         
         if (isGroup) socket.to(receiver).emit('receive_message', newMessage);
         else socket.to(receiver).emit('receive_message', newMessage);
-        socket.emit('receive_message', newMessage); // Echo back to sender
+        socket.emit('receive_message', newMessage); 
       }
-
     } catch (e) {
       console.error("Upload Error:", e);
       socket.emit('upload_error', 'Write Failed');
@@ -148,7 +144,7 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- CHAT CORE ---
+  // --- CHAT LOGIC ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -170,7 +166,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', async (data) => {
-    // Standard text/location handler
     const newMessage = new Message({ ...data, readBy: [data.sender] });
     await newMessage.save();
     socket.to(data.receiver).emit('receive_message', newMessage);
@@ -210,14 +205,13 @@ io.on('connection', (socket) => {
     socket.emit('group_joined', { id: group.groupCode, name: group.name });
   });
 
-  // --- STATUS SYNC ---
+  // --- REELS LOGIC ---
   socket.on('get_statuses', async (myCode) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false });
     const friends = new Set();
     messages.forEach(m => friends.add(m.sender === myCode ? m.receiver : m.sender));
 
     const allStatuses = await Status.find().sort({ timestamp: -1 });
-    
     const organized = allStatuses.map(s => ({
       ...s.toObject(),
       isFriend: friends.has(s.userCode),
@@ -226,6 +220,7 @@ io.on('connection', (socket) => {
       mediaUrl: s.mediaUrl.startsWith('http') ? s.mediaUrl : `https://otoevnt-server.onrender.com${s.mediaUrl}`
     }));
     
+    // Sort: Me -> Friends -> Others
     organized.sort((a, b) => {
         if (a.isMe) return -1;
         if (b.isMe) return 1;
