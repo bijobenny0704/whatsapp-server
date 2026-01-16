@@ -52,7 +52,7 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- 1. SIGNUP & OTP (DIRECT MODE) ---
+  // --- 1. SIGNUP & OTP ---
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
@@ -60,13 +60,10 @@ io.on('connection', (socket) => {
     const otp = generateOTP();
     otpStore[email] = { otp, name, password, type: 'signup' };
     
-    console.log(`[DEV MODE] Sending OTP ${otp} directly to client`);
-    
-    // SEND OTP DIRECTLY BACK TO PHONE
+    console.log(`[DEV OTP] Code for ${email}: ${otp}`);
     socket.emit('otp_sent', { email, mode: 'signup', dev_otp: otp });
   });
 
-  // --- 2. VERIFY ---
   socket.on('verify_signup_otp', async ({ email, otp }) => {
     const data = otpStore[email];
     if (!data || data.otp !== otp) return socket.emit('auth_error', 'Invalid OTP');
@@ -74,27 +71,23 @@ io.on('connection', (socket) => {
     const chatCode = generateCode();
     const newUser = new User({ name: data.name, email, password: data.password, chatCode });
     await newUser.save();
-    
     delete otpStore[email];
     socket.emit('auth_success', { name: data.name, chatCode });
   });
 
-  // --- 3. LOGIN ---
+  // --- 2. LOGIN ---
   socket.on('login', async ({ email, password }) => {
     const user = await User.findOne({ email, password });
     if (user) socket.emit('auth_success', { name: user.name, chatCode: user.chatCode });
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- 4. FORGOT PASSWORD (DIRECT MODE) ---
+  // --- 3. PASSWORD RESET ---
   socket.on('request_reset_otp', async (email) => {
     const user = await User.findOne({ email });
     if (!user) return socket.emit('auth_error', 'Email not found');
-
     const otp = generateOTP();
     otpStore[email] = { otp, type: 'reset' };
-    
-    // SEND OTP DIRECTLY BACK TO PHONE
     socket.emit('otp_sent', { email, mode: 'reset', dev_otp: otp });
   });
 
@@ -106,7 +99,7 @@ io.on('connection', (socket) => {
     socket.emit('password_reset_success');
   });
 
-  // --- 5. CHAT LOGIC ---
+  // --- 4. CHAT & GROUPS ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -120,10 +113,13 @@ io.on('connection', (socket) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false }).sort({ timestamp: -1 });
     const contactSet = new Set();
     messages.forEach(m => contactSet.add(m.sender === myCode ? m.receiver : m.sender));
+    
     const user = await User.findOne({ chatCode: myCode });
     const groups = await Group.find({ _id: { $in: (user ? user.joinedGroups : []) } });
+    
     const contacts = Array.from(contactSet).map(code => ({ id: code, name: `User ${code}`, type: 'private' }));
     const groupList = groups.map(g => ({ id: g.groupCode, name: g.name, type: 'group' }));
+    
     socket.emit('conversation_list', [...groupList, ...contacts]);
   });
 
@@ -140,28 +136,38 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
 
+  // --- GROUP CREATION FIX ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
+        if (!creatorCode) return socket.emit('error', 'Please relogin to create groups');
+        
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
+        
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
+        
         if (!user.joinedGroups) user.joinedGroups = [];
-        user.joinedGroups.push(newGroup._id);
+        // FIX: Ensure ID is string to prevent database mismatch
+        user.joinedGroups.push(newGroup._id.toString());
         await user.save();
+        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { socket.emit('error', 'Group Create Failed'); }
+      } catch (e) { 
+        console.error("Group Create Error:", e);
+        socket.emit('error', 'Group Create Failed'); 
+      }
   });
-
+  
   socket.on('join_group', async ({ groupCode, userCode }) => {
     const group = await Group.findOne({ groupCode });
     if (!group) return socket.emit('error', 'Group not found');
     if (group.members.includes(userCode)) return socket.emit('error', 'Already in group');
     group.members.push(userCode);
     await group.save();
-    await User.updateOne({ chatCode: userCode }, { $push: { joinedGroups: group._id } });
+    await User.updateOne({ chatCode: userCode }, { $push: { joinedGroups: group._id.toString() } });
     socket.join(groupCode);
     socket.emit('group_joined', { id: groupCode, name: group.name });
   });
