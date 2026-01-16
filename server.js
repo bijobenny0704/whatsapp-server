@@ -3,81 +3,49 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 const mongoose = require('mongoose');
-const nodemailer = require('nodemailer'); // New Tool
+const { Resend } = require('resend'); // Import Resend
 
 const app = express();
 app.use(cors());
 
+// ⚠️ YOUR MONGODB LINK
 const MONGO_URI = "mongodb+srv://bijobenny0704_db_user:GGqNHv2v6itXU3nw@cluster0.9wymndv.mongodb.net/whatsapp_clone?retryWrites=true&w=majority&appName=Cluster0";
+
+// ⚠️ YOUR RESEND API KEY
+const resend = new Resend('re_Eos7HEz9_8FETvRnM5PafFFpLM7PfiqH1'); // <-- PASTE YOUR KEY HERE
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ DB Error:', err));
 
-// --- EMAIL SETUP ---
-// ⚠️ REPLACE WITH YOUR REAL GMAIL & APP PASSWORD
-// --- EMAIL SETUP (Attempt 2: Port 587) ---
-// --- EMAIL SETUP (Attempt 2: Port 587) ---
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,              // TLS Port (More reliable on Cloud)
-  secure: false,          // Must be false for port 587
-  requireTLS: true,       // Force security
-  auth: {
-    user: 'bijobenny0704@gmail.com', 
-    pass: 'cqzk foik apum myge' // ⚠️ Make sure this is your LATEST App Password
-  }
-});
+// ... (Keep your User/Group/Message Schemas same as before) ...
 
-// --- TEMPORARY OTP STORAGE ---
-// In a real app, use Redis. For demo, we use memory.
-let otpStore = {}; 
-
-// --- SCHEMAS ---
-const userSchema = new mongoose.Schema({
-  name: String,
-  email: { type: String, unique: true },
-  password: String,
-  chatCode: { type: String, unique: true }, 
-  joinedGroups: [String] 
-});
-
-const groupSchema = new mongoose.Schema({
-  name: String,
-  groupCode: { type: String, unique: true },
-  members: [String],
-  admin: String
-});
-
-const messageSchema = new mongoose.Schema({
-  text: String,
-  sender: String, senderName: String, receiver: String,
-  isGroup: { type: Boolean, default: false },
-  timestamp: { type: Date, default: Date.now }
-});
-
-const User = mongoose.model('User', userSchema);
-const Group = mongoose.model('Group', groupSchema);
-const Message = mongoose.model('Message', messageSchema);
-
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-
-const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
-
-// Helper to send email
+// --- NEW EMAIL FUNCTION (Uses HTTP, works on Render) ---
 const sendOTPEmail = async (email, otp, type) => {
   const subject = type === 'signup' ? 'Verify Your Account' : 'Reset Password Request';
-  const text = `Your One-Time Password (OTP) is: ${otp}\n\nThis code expires in 5 minutes.`;
+  const htmlContent = `
+    <h1>${subject}</h1>
+    <p>Your code is: <strong>${otp}</strong></p>
+    <p>This code expires in 5 minutes.</p>
+  `;
+
   try {
-    await transporter.sendMail({ from: '"OTOEVNT Security" <no-reply@otoevnt.com>', to: email, subject, text });
+    const data = await resend.emails.send({
+      from: 'onboarding@resend.dev', // Use this exact email for testing
+      to: email,                     // Only works with YOUR registered email in testing
+      subject: subject,
+      html: htmlContent
+    });
+    
+    console.log("[SUCCESS] Email ID:", data.id);
     return true;
   } catch (err) {
-    console.error("Email Error:", err);
+    console.error("[ERROR] Email Failed:", err);
     return false;
   }
 };
+
+// ... (Keep the rest of your server code: io.on connection, etc.) ...
 
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
