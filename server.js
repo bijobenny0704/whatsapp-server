@@ -38,9 +38,18 @@ const messageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
+// NEW: Status Schema (Expires in 24 hours)
+const statusSchema = new mongoose.Schema({
+  text: String,
+  userCode: String,
+  userName: String,
+  timestamp: { type: Date, default: Date.now, expires: 86400 } // 86400s = 24h
+});
+
 const User = mongoose.model('User', userSchema);
 const Group = mongoose.model('Group', groupSchema);
 const Message = mongoose.model('Message', messageSchema);
+const Status = mongoose.model('Status', statusSchema);
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -53,13 +62,12 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- 1. SIGNUP & OTP ---
+  // --- 1. AUTH & OTP ---
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
     const otp = generateOTP();
     otpStore[email] = { otp, name, password, type: 'signup' };
-    console.log(`[DEV OTP] Code for ${email}: ${otp}`);
     socket.emit('otp_sent', { email, mode: 'signup', dev_otp: otp });
   });
 
@@ -73,14 +81,12 @@ io.on('connection', (socket) => {
     socket.emit('auth_success', { name: data.name, chatCode });
   });
 
-  // --- 2. LOGIN ---
   socket.on('login', async ({ email, password }) => {
     const user = await User.findOne({ email, password });
     if (user) socket.emit('auth_success', { name: user.name, chatCode: user.chatCode });
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- 3. PASSWORD RESET ---
   socket.on('request_reset_otp', async (email) => {
     const user = await User.findOne({ email });
     if (!user) return socket.emit('auth_error', 'Email not found');
@@ -97,7 +103,7 @@ io.on('connection', (socket) => {
     socket.emit('password_reset_success');
   });
 
-  // --- 4. CHAT LOGIC ---
+  // --- 2. CHAT & GROUPS ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -132,19 +138,14 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
 
-  // --- 5. GROUP LOGIC ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
-        if (groupName.length < 3) return socket.emit('error', 'Name too short (min 3 chars)');
-        
-        // Check Duplicate Name
+        if (groupName.length < 3) return socket.emit('error', 'Name too short');
         const existingGroup = await Group.findOne({ name: groupName });
         if (existingGroup) return socket.emit('error', `Group "${groupName}" already exists!`);
-
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
-        
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
@@ -156,24 +157,41 @@ io.on('connection', (socket) => {
       } catch (e) { socket.emit('error', 'Group Create Failed'); }
   });
   
-  // --- UPDATED JOIN LOGIC (Name OR Code) ---
   socket.on('join_group', async ({ groupIdentifier, userCode }) => {
-    // Search by EITHER Group Code OR Group Name
-    const group = await Group.findOne({
-      $or: [
-        { groupCode: groupIdentifier },
-        { name: groupIdentifier }
-      ]
-    });
-
-    if (!group) return socket.emit('error', 'Group not found (Check Name or Code)');
+    const group = await Group.findOne({ $or: [{ groupCode: groupIdentifier }, { name: groupIdentifier }] });
+    if (!group) return socket.emit('error', 'Group not found');
     if (group.members.includes(userCode)) return socket.emit('error', 'Already in group');
-
     group.members.push(userCode);
     await group.save();
     await User.updateOne({ chatCode: userCode }, { $push: { joinedGroups: group._id.toString() } });
     socket.join(group.groupCode);
     socket.emit('group_joined', { id: group.groupCode, name: group.name });
+  });
+
+  // --- 3. STATUS LOGIC (NEW) ---
+  socket.on('post_status', async ({ text, userCode, userName }) => {
+    const newStatus = new Status({ text, userCode, userName });
+    await newStatus.save();
+    io.emit('status_updated'); // Broadcast update to everyone
+  });
+
+  socket.on('get_statuses', async (myCode) => {
+    // 1. Find Chat Friends
+    const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false });
+    const friends = new Set();
+    messages.forEach(m => friends.add(m.sender === myCode ? m.receiver : m.sender));
+
+    // 2. Get All Statuses
+    const allStatuses = await Status.find().sort({ timestamp: -1 });
+
+    // 3. Mark Friends vs Others
+    const organized = allStatuses.map(s => ({
+      ...s.toObject(),
+      isFriend: friends.has(s.userCode),
+      isMe: s.userCode === myCode
+    }));
+
+    socket.emit('status_list', organized);
   });
 });
 
