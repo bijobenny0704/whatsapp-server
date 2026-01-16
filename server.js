@@ -17,10 +17,12 @@ mongoose.connect(MONGO_URI)
 // --- EMAIL SETUP ---
 // ⚠️ REPLACE WITH YOUR REAL GMAIL & APP PASSWORD
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: "smtp.gmail.com", // Explicit Host
+  port: 465,              // Explicit Secure Port
+  secure: true,           // Use SSL
   auth: {
-    user: 'bijobenny0704@gmail.com', // Put your email here
-    pass: 'cqzk foik apum myge'    // Put your 16-digit App Password here
+    user: 'bijobenny0704@gmail.com', 
+    pass: 'cqzk foik apum myge'  // Your App Password
   }
 });
 
