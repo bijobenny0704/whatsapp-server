@@ -1,20 +1,20 @@
 {
   "name": "otoevnt-server",
   "version": "1.0.0",
-  "description": "Real-time chat server for OTOEVNT Demo",
+  "description": "Real-time chat server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "mongoose": "^9.1.4",
-    "nodemailer": "^7.0.12",
-    "resend": "^6.7.0",
-    "socket.io": "^4.7.2"
+    "express": "^4.19.2",
+    "mongoose": "^8.2.0",
+    "nodemailer": "^6.9.12",
+    "resend": "^3.2.0",
+    "socket.io": "^4.7.5"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   }
 }
