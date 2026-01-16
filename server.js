@@ -24,20 +24,19 @@ const userSchema = new mongoose.Schema({
 });
 
 const groupSchema = new mongoose.Schema({
-  name: String,
+  name: { type: String, unique: true }, // Added Unique constraint
   groupCode: { type: String, unique: true },
   members: [String],
   admin: String
 });
 
-// NEW: 'readBy' tracks everyone who saw the message
 const messageSchema = new mongoose.Schema({
   text: String,
   sender: String, 
   senderName: String, 
   receiver: String,
   isGroup: { type: Boolean, default: false },
-  readBy: [String], // Array of ChatCodes who saw this
+  readBy: [String], 
   timestamp: { type: Date, default: Date.now }
 });
 
@@ -122,7 +121,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', async (data) => {
-    // Initialize 'readBy' with the sender (so sender has "seen" it)
     const newMessage = new Message({ ...data, readBy: [data.sender] });
     await newMessage.save();
     socket.to(data.receiver).emit('receive_message', newMessage);
@@ -131,33 +129,42 @@ io.on('connection', (socket) => {
 
   socket.on('get_history', async ({ myCode, partnerId, isGroup }) => {
     const query = isGroup ? { receiver: partnerId, isGroup: true } : { $or: [{ sender: myCode, receiver: partnerId }, { sender: partnerId, receiver: myCode }], isGroup: false };
-    
-    // 1. Get Messages
     const history = await Message.find(query).sort({ timestamp: 1 });
-    
-    // 2. MARK AS SEEN (Add myCode to 'readBy' array for these messages)
     await Message.updateMany(query, { $addToSet: { readBy: myCode } });
-
     socket.emit('history', history);
   });
 
+  // --- 5. GROUP CREATION (WITH UNIQUE NAME CHECK) ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
+        
+        // 1. Check Name Length
+        if (groupName.length < 3) return socket.emit('error', 'Name too short (min 3 chars)');
+
+        // 2. Check if Name Exists (NEW)
+        const existingGroup = await Group.findOne({ name: groupName });
+        if (existingGroup) {
+            return socket.emit('error', `Group name "${groupName}" is already taken!`);
+        }
+
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
         
-        if (groupName.length < 3) return socket.emit('error', 'Name too short'); // Backend check
-
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
+        
         if (!user.joinedGroups) user.joinedGroups = [];
         user.joinedGroups.push(newGroup._id.toString());
         await user.save();
+        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { socket.emit('error', 'Group Create Failed'); }
+      } catch (e) { 
+        console.error("Group Create Error:", e);
+        socket.emit('error', 'Group Create Failed'); 
+      }
   });
   
   socket.on('join_group', async ({ groupCode, userCode }) => {
