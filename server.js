@@ -3,57 +3,52 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 const mongoose = require('mongoose');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend'); // New Email Tool
 
 const app = express();
 app.use(cors());
 
-// ⚠️ YOUR MONGODB CONNECTION
+// ⚠️ YOUR MONGODB LINK
 const MONGO_URI = "mongodb+srv://bijobenny0704_db_user:GGqNHv2v6itXU3nw@cluster0.9wymndv.mongodb.net/whatsapp_clone?retryWrites=true&w=majority&appName=Cluster0";
+
+// ⚠️ PASTE YOUR RESEND API KEY HERE
+const resend = new Resend('re_Eos7HEz9_8FETvRnM5PafFFpLM7PfiqH1'); 
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ DB Error:', err));
 
-// --- EMAIL SETUP ---
-// ⚠️ FILL IN YOUR DETAILS HERE ⚠️
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // true for 465, false for other ports
-  auth: {
-    user: 'bijobenny0704@gmail.com',  // <--- PUT YOUR EMAIL HERE
-    pass: 'jcgt arxq crtr jemy'         // <--- PUT YOUR APP PASSWORD HERE
-  }
-});
-
-// --- OTP HELPER (Sends Email + Logs to Console) ---
+// --- NEW EMAIL FUNCTION (Fast & Not Blocked) ---
 const sendOTPEmail = async (email, otp, type) => {
+  const subject = type === 'signup' ? 'Verify Your Account' : 'Reset Password Request';
+  
+  // LOGS (So you can still see it if email fails)
   console.log("========================================");
-  console.log(`[LOG-IN FALLBACK] OTP for ${email} is: ${otp}`); 
+  console.log(`[ATTEMPTING EMAIL] To: ${email} | OTP: ${otp}`);
   console.log("========================================");
-
-  const subject = type === 'signup' ? 'Verify Your Account' : 'Reset Password';
-  const text = `Your OTP is: ${otp}`;
 
   try {
-    await transporter.sendMail({ 
-        from: '"OTOEVNT App" <no-reply@otoevnt.com>', 
-        to: email, 
-        subject, 
-        text 
+    const data = await resend.emails.send({
+      from: 'onboarding@resend.dev', // Default testing email
+      to: email,                     // ⚠️ In Free Mode, this MUST be YOUR account email
+      subject: subject,
+      html: `<p>Your OTOEVNT Code is: <strong>${otp}</strong></p>`
     });
-    console.log(`[SUCCESS] Email sent to ${email}`);
+
+    if (data.error) {
+      console.error("[EMAIL ERROR]", data.error);
+      return false;
+    }
+
+    console.log("[SUCCESS] Email Sent! ID:", data.id);
     return true;
   } catch (err) {
-    console.error(`[EMAIL ERROR] Could not send email: ${err.message}`);
-    // We return TRUE anyway so the app doesn't freeze. 
-    // You can get the OTP from the logs above.
-    return true; 
+    console.error("[CRASH] Email Failed:", err);
+    return false; // App will fallback to logs
   }
 };
 
-// --- DATABASE SCHEMAS ---
+// --- SCHEMAS ---
 const userSchema = new mongoose.Schema({
   name: String,
   email: { type: String, unique: true },
@@ -84,15 +79,15 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString(); 
 
 // --- SOCKET LOGIC ---
-let otpStore = {}; // Temporary memory for OTPs
+let otpStore = {}; 
 
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // 1. SIGNUP REQUEST
+  // 1. SIGNUP
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
@@ -100,12 +95,14 @@ io.on('connection', (socket) => {
     const otp = generateOTP();
     otpStore[email] = { otp, name, password, type: 'signup' };
     
-    // Send Email (and log to console)
+    // Send Email
     await sendOTPEmail(email, otp, 'signup');
+    
+    // Always tell app "Sent" so it moves to next screen (Logs act as backup)
     socket.emit('otp_sent', { email, mode: 'signup' });
   });
 
-  // 2. VERIFY OTP
+  // 2. VERIFY
   socket.on('verify_signup_otp', async ({ email, otp }) => {
     const data = otpStore[email];
     if (!data || data.otp !== otp) return socket.emit('auth_error', 'Invalid OTP');
@@ -125,7 +122,7 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // 4. CHAT & GROUPS
+  // 4. CHAT (Standard)
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -139,13 +136,10 @@ io.on('connection', (socket) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false }).sort({ timestamp: -1 });
     const contactSet = new Set();
     messages.forEach(m => contactSet.add(m.sender === myCode ? m.receiver : m.sender));
-    
     const user = await User.findOne({ chatCode: myCode });
     const groups = await Group.find({ _id: { $in: (user ? user.joinedGroups : []) } });
-    
     const contacts = Array.from(contactSet).map(code => ({ id: code, name: `User ${code}`, type: 'private' }));
     const groupList = groups.map(g => ({ id: g.groupCode, name: g.name, type: 'group' }));
-    
     socket.emit('conversation_list', [...groupList, ...contacts]);
   });
 
@@ -162,7 +156,6 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
   
-  // Group creation logic
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         const user = await User.findOne({ chatCode: creatorCode });
