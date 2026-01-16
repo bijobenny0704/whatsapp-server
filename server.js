@@ -30,10 +30,14 @@ const groupSchema = new mongoose.Schema({
   admin: String
 });
 
+// NEW: 'readBy' tracks everyone who saw the message
 const messageSchema = new mongoose.Schema({
   text: String,
-  sender: String, senderName: String, receiver: String,
+  sender: String, 
+  senderName: String, 
+  receiver: String,
   isGroup: { type: Boolean, default: false },
+  readBy: [String], // Array of ChatCodes who saw this
   timestamp: { type: Date, default: Date.now }
 });
 
@@ -56,10 +60,8 @@ io.on('connection', (socket) => {
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
-
     const otp = generateOTP();
     otpStore[email] = { otp, name, password, type: 'signup' };
-    
     console.log(`[DEV OTP] Code for ${email}: ${otp}`);
     socket.emit('otp_sent', { email, mode: 'signup', dev_otp: otp });
   });
@@ -67,7 +69,6 @@ io.on('connection', (socket) => {
   socket.on('verify_signup_otp', async ({ email, otp }) => {
     const data = otpStore[email];
     if (!data || data.otp !== otp) return socket.emit('auth_error', 'Invalid OTP');
-
     const chatCode = generateCode();
     const newUser = new User({ name: data.name, email, password: data.password, chatCode });
     await newUser.save();
@@ -99,7 +100,7 @@ io.on('connection', (socket) => {
     socket.emit('password_reset_success');
   });
 
-  // --- 4. CHAT & GROUPS ---
+  // --- 4. CHAT LOGIC ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -113,18 +114,16 @@ io.on('connection', (socket) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false }).sort({ timestamp: -1 });
     const contactSet = new Set();
     messages.forEach(m => contactSet.add(m.sender === myCode ? m.receiver : m.sender));
-    
     const user = await User.findOne({ chatCode: myCode });
     const groups = await Group.find({ _id: { $in: (user ? user.joinedGroups : []) } });
-    
     const contacts = Array.from(contactSet).map(code => ({ id: code, name: `User ${code}`, type: 'private' }));
     const groupList = groups.map(g => ({ id: g.groupCode, name: g.name, type: 'group' }));
-    
     socket.emit('conversation_list', [...groupList, ...contacts]);
   });
 
   socket.on('send_message', async (data) => {
-    const newMessage = new Message(data);
+    // Initialize 'readBy' with the sender (so sender has "seen" it)
+    const newMessage = new Message({ ...data, readBy: [data.sender] });
     await newMessage.save();
     socket.to(data.receiver).emit('receive_message', newMessage);
     socket.emit('receive_message', newMessage); 
@@ -132,33 +131,33 @@ io.on('connection', (socket) => {
 
   socket.on('get_history', async ({ myCode, partnerId, isGroup }) => {
     const query = isGroup ? { receiver: partnerId, isGroup: true } : { $or: [{ sender: myCode, receiver: partnerId }, { sender: partnerId, receiver: myCode }], isGroup: false };
+    
+    // 1. Get Messages
     const history = await Message.find(query).sort({ timestamp: 1 });
+    
+    // 2. MARK AS SEEN (Add myCode to 'readBy' array for these messages)
+    await Message.updateMany(query, { $addToSet: { readBy: myCode } });
+
     socket.emit('history', history);
   });
 
-  // --- GROUP CREATION FIX ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
-        if (!creatorCode) return socket.emit('error', 'Please relogin to create groups');
-        
+        if (!creatorCode) return socket.emit('error', 'Please relogin');
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
         
+        if (groupName.length < 3) return socket.emit('error', 'Name too short'); // Backend check
+
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
-        
         if (!user.joinedGroups) user.joinedGroups = [];
-        // FIX: Ensure ID is string to prevent database mismatch
         user.joinedGroups.push(newGroup._id.toString());
         await user.save();
-        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { 
-        console.error("Group Create Error:", e);
-        socket.emit('error', 'Group Create Failed'); 
-      }
+      } catch (e) { socket.emit('error', 'Group Create Failed'); }
   });
   
   socket.on('join_group', async ({ groupCode, userCode }) => {
