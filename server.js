@@ -63,63 +63,66 @@ const Message = mongoose.model('Message', messageSchema);
 const Status = mongoose.model('Status', statusSchema);
 
 const server = http.createServer(app);
-const io = new Server(server, { 
-  cors: { origin: "*" },
-  maxHttpBufferSize: 1e8 // 100 MB Limit
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString(); 
 
+// --- 1. NEW: DIRECT STREAM UPLOAD (Fixes Large Videos) ---
+// This accepts the raw file stream directly from the phone
+app.post('/upload_stream', (req, res) => {
+  const ext = req.query.ext || 'jpg';
+  const fileName = `file_${Date.now()}.${ext}`;
+  const filePath = path.join(UPLOAD_DIR, fileName);
+  
+  // Create a writable stream to the disk
+  const writeStream = fs.createWriteStream(filePath);
+  
+  // Pipe the request (phone data) -> disk
+  req.pipe(writeStream);
+
+  writeStream.on('finish', () => {
+    // Return the URL to the phone
+    res.json({ url: `/uploads/${fileName}`, success: true });
+  });
+
+  writeStream.on('error', (err) => {
+    console.error("Stream Error:", err);
+    res.status(500).json({ error: "Upload Failed" });
+  });
+});
+
+// --- SOCKET LOGIC ---
 let otpStore = {}; 
 
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- 1. MEDIA UPLOAD (BASE64 SUPPORT) ---
-  socket.on('upload_media', async ({ fileData, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
-    try {
-      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}...`);
+  // --- 2. FINALIZE MEDIA (After Upload is Done) ---
+  socket.on('finalize_media', async ({ mediaUrl, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
+    // The file is already uploaded via HTTP. Now we just save the DB entry.
+    if (type === 'status') {
+      const newStatus = new Status({ text: caption, mediaUrl, mediaType, userCode, userName });
+      await newStatus.save();
+      io.emit('status_updated'); 
+    } 
+    else if (type === 'chat') {
+      const newMessage = new Message({
+        text: caption || (mediaType === 'image' ? '📷 Photo' : '🎥 Video'),
+        msgType: mediaType,
+        mediaUrl,
+        sender: userCode, senderName: userName, receiver, isGroup,
+        readBy: [userCode]
+      });
+      await newMessage.save();
       
-      // Convert Base64 to Buffer
-      const buffer = Buffer.from(fileData, 'base64');
-      
-      const ext = mediaType === 'video' ? 'mp4' : 'jpg';
-      const fileName = `${type}_${Date.now()}.${ext}`;
-      const filePath = path.join(UPLOAD_DIR, fileName);
-      
-      fs.writeFileSync(filePath, buffer);
-      
-      // ⚠️ PRODUCTION URL
-      const fileUrl = `/uploads/${fileName}`; 
-
-      if (type === 'status') {
-        const newStatus = new Status({ text: caption, mediaUrl: fileUrl, mediaType, userCode, userName });
-        await newStatus.save();
-        io.emit('status_updated'); 
-        socket.emit('upload_success');
-      } 
-      else if (type === 'chat') {
-        const newMessage = new Message({
-          text: caption || (mediaType === 'image' ? '📷 Photo' : '🎥 Video'),
-          msgType: mediaType,
-          mediaUrl: fileUrl,
-          sender: userCode, senderName: userName, receiver, isGroup,
-          readBy: [userCode]
-        });
-        await newMessage.save();
-        
-        if (isGroup) socket.to(receiver).emit('receive_message', newMessage);
-        else socket.to(receiver).emit('receive_message', newMessage);
-        socket.emit('receive_message', newMessage); 
-      }
-    } catch (e) {
-      console.error("Upload Error:", e);
-      socket.emit('upload_error', 'Upload Failed');
+      if (isGroup) socket.to(receiver).emit('receive_message', newMessage);
+      else socket.to(receiver).emit('receive_message', newMessage);
+      socket.emit('receive_message', newMessage); 
     }
   });
 
-  // --- 2. AUTH ---
+  // --- 3. AUTH ---
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
@@ -145,7 +148,7 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- 3. CHAT ---
+  // --- 4. CHAT ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -180,31 +183,22 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
 
-  // --- 4. GROUPS (FIXED) ---
+  // --- 5. GROUPS ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
         if (groupName.length < 3) return socket.emit('error', 'Name too short');
-        
-        // Fix: Case insensitive check
         const existing = await Group.findOne({ name: { $regex: new RegExp(`^${groupName}$`, 'i') } });
         if (existing) return socket.emit('error', 'Group name taken');
-        
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
-
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
-        
         await User.updateOne({ chatCode: creatorCode }, { $push: { joinedGroups: newGroup._id.toString() } });
-        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { 
-        console.error("Group Error:", e);
-        socket.emit('error', 'Group Create Failed'); 
-      }
+      } catch (e) { socket.emit('error', 'Group Create Failed'); }
   });
   
   socket.on('join_group', async ({ groupIdentifier, userCode }) => {
@@ -218,21 +212,25 @@ io.on('connection', (socket) => {
     socket.emit('group_joined', { id: group.groupCode, name: group.name });
   });
 
-  // --- 5. REELS ---
+  // --- 6. REELS ---
   socket.on('get_statuses', async (myCode) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false });
     const friends = new Set();
     messages.forEach(m => friends.add(m.sender === myCode ? m.receiver : m.sender));
-
     const allStatuses = await Status.find().sort({ timestamp: -1 });
     const organized = allStatuses.map(s => ({
       ...s.toObject(),
       isFriend: friends.has(s.userCode),
       isMe: s.userCode === myCode,
-      // Fix URL for App usage
       mediaUrl: s.mediaUrl.startsWith('http') ? s.mediaUrl : `https://otoevnt-server.onrender.com${s.mediaUrl}`
     }));
-    
+    organized.sort((a, b) => {
+        if (a.isMe) return -1;
+        if (b.isMe) return 1;
+        if (a.isFriend && !b.isFriend) return -1;
+        if (!a.isFriend && b.isFriend) return 1;
+        return 0;
+    });
     socket.emit('status_list', organized);
   });
 });
