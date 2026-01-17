@@ -9,7 +9,7 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// STATIC FILES
+// STATIC FILES (For Videos/Images)
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -37,10 +37,9 @@ const groupSchema = new mongoose.Schema({
   admin: String
 });
 
-// Chat Messages (Supports Text, Image, Video, Location)
 const messageSchema = new mongoose.Schema({
   text: String, 
-  msgType: { type: String, default: 'text' }, // 'text', 'image', 'video', 'location'
+  msgType: { type: String, default: 'text' }, 
   mediaUrl: String,
   location: { latitude: Number, longitude: Number },
   sender: String, senderName: String, receiver: String,
@@ -49,7 +48,6 @@ const messageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
-// Status/Reels (Supports Image, Video)
 const statusSchema = new mongoose.Schema({
   text: String,
   mediaUrl: String,
@@ -78,24 +76,22 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- UNIVERSAL MEDIA UPLOAD ---
+  // --- 1. MEDIA UPLOAD ---
   socket.on('upload_media', async ({ buffer, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
     try {
-      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}...`);
-      
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
       const fileName = `${type}_${Date.now()}.${ext}`;
       const filePath = path.join(UPLOAD_DIR, fileName);
       
       fs.writeFileSync(filePath, buffer);
       
-      // PRODUCTION URL
+      // ⚠️ IMPORTANT: In production, this needs your full Render URL
       const fileUrl = `/uploads/${fileName}`; 
 
       if (type === 'status') {
         const newStatus = new Status({ text: caption, mediaUrl: fileUrl, mediaType, userCode, userName });
         await newStatus.save();
-        io.emit('status_updated'); // Refresh everyone's reels
+        io.emit('status_updated'); 
         socket.emit('upload_success');
       } 
       else if (type === 'chat') {
@@ -114,17 +110,17 @@ io.on('connection', (socket) => {
       }
     } catch (e) {
       console.error("Upload Error:", e);
-      socket.emit('upload_error', 'Write Failed');
+      socket.emit('upload_error', 'Upload Failed');
     }
   });
 
-  // --- AUTH ---
+  // --- 2. AUTH ---
   socket.on('request_signup_otp', async ({ name, email, password }) => {
     const existing = await User.findOne({ email });
     if (existing) return socket.emit('auth_error', 'Email already exists');
     const otp = generateOTP();
     otpStore[email] = { otp, name, password, type: 'signup' };
-    console.log(`[DEV OTP] Code: ${otp}`);
+    console.log(`[OTP] ${email}: ${otp}`);
     socket.emit('otp_sent', { email, mode: 'signup', dev_otp: otp });
   });
 
@@ -144,7 +140,23 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  // --- CHAT LOGIC ---
+  socket.on('request_reset_otp', async (email) => {
+    const user = await User.findOne({ email });
+    if (!user) return socket.emit('auth_error', 'Email not found');
+    const otp = generateOTP();
+    otpStore[email] = { otp, type: 'reset' };
+    socket.emit('otp_sent', { email, mode: 'reset', dev_otp: otp });
+  });
+
+  socket.on('reset_password', async ({ email, otp, newPassword }) => {
+    const data = otpStore[email];
+    if (!data || data.otp !== otp) return socket.emit('auth_error', 'Invalid OTP');
+    await User.updateOne({ email }, { password: newPassword });
+    delete otpStore[email];
+    socket.emit('password_reset_success');
+  });
+
+  // --- 3. CHAT ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
     const user = await User.findOne({ chatCode: myCode });
@@ -179,19 +191,31 @@ io.on('connection', (socket) => {
     socket.emit('history', history);
   });
 
+  // --- 4. GROUPS (FIXED) ---
   socket.on('create_group', async ({ groupName, creatorCode }) => {
       try {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
         if (groupName.length < 3) return socket.emit('error', 'Name too short');
+        
         const existing = await Group.findOne({ name: groupName });
         if (existing) return socket.emit('error', 'Group name taken');
+        
+        const user = await User.findOne({ chatCode: creatorCode });
+        if (!user) return socket.emit('error', 'User not found');
+
         const gCode = generateCode();
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
+        
+        // FIX: Ensure it is pushed as a String
         await User.updateOne({ chatCode: creatorCode }, { $push: { joinedGroups: newGroup._id.toString() } });
+        
         socket.join(gCode);
         socket.emit('group_created', { id: gCode, name: groupName });
-      } catch (e) { socket.emit('error', 'Failed'); }
+      } catch (e) { 
+        console.error("Group Error:", e);
+        socket.emit('error', 'Group Create Failed'); 
+      }
   });
   
   socket.on('join_group', async ({ groupIdentifier, userCode }) => {
@@ -205,7 +229,7 @@ io.on('connection', (socket) => {
     socket.emit('group_joined', { id: group.groupCode, name: group.name });
   });
 
-  // --- REELS LOGIC ---
+  // --- 5. REELS ---
   socket.on('get_statuses', async (myCode) => {
     const messages = await Message.find({ $or: [{ sender: myCode }, { receiver: myCode }], isGroup: false });
     const friends = new Set();
