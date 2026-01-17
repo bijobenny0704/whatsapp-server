@@ -9,7 +9,7 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// STATIC FILES (For Videos/Images)
+// STATIC FILES
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -76,16 +76,21 @@ let otpStore = {};
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
 
-  // --- 1. MEDIA UPLOAD ---
-  socket.on('upload_media', async ({ buffer, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
+  // --- 1. MEDIA UPLOAD (BASE64 SUPPORT) ---
+  socket.on('upload_media', async ({ fileData, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
     try {
+      console.log(`[UPLOAD] Receiving ${mediaType} from ${userName}...`);
+      
+      // Convert Base64 to Buffer
+      const buffer = Buffer.from(fileData, 'base64');
+      
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
       const fileName = `${type}_${Date.now()}.${ext}`;
       const filePath = path.join(UPLOAD_DIR, fileName);
       
       fs.writeFileSync(filePath, buffer);
       
-      // ⚠️ IMPORTANT: In production, this needs your full Render URL
+      // ⚠️ PRODUCTION URL
       const fileUrl = `/uploads/${fileName}`; 
 
       if (type === 'status') {
@@ -140,22 +145,6 @@ io.on('connection', (socket) => {
     else socket.emit('auth_error', 'Invalid credentials');
   });
 
-  socket.on('request_reset_otp', async (email) => {
-    const user = await User.findOne({ email });
-    if (!user) return socket.emit('auth_error', 'Email not found');
-    const otp = generateOTP();
-    otpStore[email] = { otp, type: 'reset' };
-    socket.emit('otp_sent', { email, mode: 'reset', dev_otp: otp });
-  });
-
-  socket.on('reset_password', async ({ email, otp, newPassword }) => {
-    const data = otpStore[email];
-    if (!data || data.otp !== otp) return socket.emit('auth_error', 'Invalid OTP');
-    await User.updateOne({ email }, { password: newPassword });
-    delete otpStore[email];
-    socket.emit('password_reset_success');
-  });
-
   // --- 3. CHAT ---
   socket.on('join_self', async (myCode) => {
     socket.join(myCode);
@@ -197,7 +186,8 @@ io.on('connection', (socket) => {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
         if (groupName.length < 3) return socket.emit('error', 'Name too short');
         
-        const existing = await Group.findOne({ name: groupName });
+        // Fix: Case insensitive check
+        const existing = await Group.findOne({ name: { $regex: new RegExp(`^${groupName}$`, 'i') } });
         if (existing) return socket.emit('error', 'Group name taken');
         
         const user = await User.findOne({ chatCode: creatorCode });
@@ -207,7 +197,6 @@ io.on('connection', (socket) => {
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
         
-        // FIX: Ensure it is pushed as a String
         await User.updateOne({ chatCode: creatorCode }, { $push: { joinedGroups: newGroup._id.toString() } });
         
         socket.join(gCode);
@@ -244,15 +233,6 @@ io.on('connection', (socket) => {
       mediaUrl: s.mediaUrl.startsWith('http') ? s.mediaUrl : `https://otoevnt-server.onrender.com${s.mediaUrl}`
     }));
     
-    // Sort: Me -> Friends -> Others
-    organized.sort((a, b) => {
-        if (a.isMe) return -1;
-        if (b.isMe) return 1;
-        if (a.isFriend && !b.isFriend) return -1;
-        if (!a.isFriend && b.isFriend) return 1;
-        return 0;
-    });
-
     socket.emit('status_list', organized);
   });
 });
