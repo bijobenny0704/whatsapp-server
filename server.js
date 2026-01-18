@@ -62,6 +62,7 @@ const Message = mongoose.model('Message', messageSchema);
 const Status = mongoose.model('Status', statusSchema);
 
 const server = http.createServer(app);
+// ⚠️ INCREASED LIMIT TO 100MB FOR VIDEOS
 const io = new Server(server, { cors: { origin: "*" }, maxHttpBufferSize: 1e8 });
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -75,13 +76,13 @@ io.on('connection', (socket) => {
   // --- MEDIA UPLOAD ---
   socket.on('upload_media', async ({ fileData, type, mediaType, userCode, userName, caption, receiver, isGroup }) => {
     try {
+      console.log(`Receiving ${mediaType} upload for ${type}...`); // Debug log
       const buffer = Buffer.from(fileData, 'base64');
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
       const fileName = `${type}_${Date.now()}.${ext}`;
       const filePath = path.join(UPLOAD_DIR, fileName);
       fs.writeFileSync(filePath, buffer);
       
-      // ⚠️ PRODUCTION URL (Change this when deploying)
       const fileUrl = `/uploads/${fileName}`; 
 
       if (type === 'status') {
@@ -99,11 +100,15 @@ io.on('connection', (socket) => {
           readBy: [userCode]
         });
         await newMessage.save();
+        // Emit to receiver AND sender so it shows up instantly
         if (isGroup) socket.to(receiver).emit('receive_message', newMessage);
         else socket.to(receiver).emit('receive_message', newMessage);
         socket.emit('receive_message', newMessage); 
       }
-    } catch (e) { socket.emit('upload_error', 'Upload Failed'); }
+    } catch (e) { 
+        console.error("Upload Error:", e);
+        socket.emit('upload_error', 'Upload Failed on Server'); 
+    }
   });
 
   // --- AUTH ---
@@ -187,8 +192,9 @@ io.on('connection', (socket) => {
         if (!creatorCode) return socket.emit('error', 'Please relogin');
         if (groupName.length < 3) return socket.emit('error', 'Name too short');
         
+        // CHECK FOR DUPLICATES
         const existing = await Group.findOne({ name: { $regex: new RegExp(`^${groupName}$`, 'i') } });
-        if (existing) return socket.emit('error', 'Group name taken');
+        if (existing) return socket.emit('error', 'Group name taken!'); // ⚠️ Explicit Error
         
         const user = await User.findOne({ chatCode: creatorCode });
         if (!user) return socket.emit('error', 'User not found');
@@ -197,7 +203,6 @@ io.on('connection', (socket) => {
         const newGroup = new Group({ name: groupName, groupCode: gCode, admin: creatorCode, members: [creatorCode] });
         await newGroup.save();
         
-        // Critical Fix: Push the ID as a string immediately
         await User.updateOne({ chatCode: creatorCode }, { $push: { joinedGroups: newGroup._id.toString() } });
         
         socket.join(gCode);
